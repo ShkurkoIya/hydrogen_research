@@ -1,0 +1,21 @@
+[package]
+name = "test_mold"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-tiff = { version = "0.4.0", features = ["object_store", "reqwest", "jpeg2k", "lerc", "lzma", "ndarray", "tokio", "webp"] }
+async-trait = "0.1.92"
+bytes = "1.12.1"
+futures = "0.3.34"
+image = "0.25.10"
+object_store = { version = "0.14.2", features = ["http"] }
+polars = { version = "0.55.2", features = ["lazy", "csv", "fmt", "dtype-struct"], default-features = false }
+proj4rs = "0.3.0"
+reqwest = { version = "0.13.5", features = ["blocking", "cookies", "json", "query", "stream"] }
+serde_json = "1.0.154"
+stac-api = "0.8.2"
+stac-async = "0.5.4"
+stac-client = "0.3.0"
+tokio = { version = "1.54.1", features = ["full"] }
+url = "2.5.8"
