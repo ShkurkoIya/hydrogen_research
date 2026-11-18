@@ -77,47 +77,71 @@ impl RemoteCog {
         })
     }
 
-    /// Вычитывает конкретный тайл (tile_x, tile_y) и декодирует его в u16
+    /// Вычитывает конкретный тайл (tile_x, tile_y) и декодирует его в u16.
+    /// Если тайл на краю снимка пустой или обрезан — безопасно возвращает нули (NoData).
     pub async fn fetch_tile_u16(
         &self,
         tile_x: usize,
         tile_y: usize,
     ) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
+        let expected_pixels = self.tile_width * self.tile_height;
         let ifd = self.tiff.ifds().first().ok_or("Нет базового IFD")?;
-        let tile = ifd.fetch_tile(tile_x, tile_y, self.reader.as_ref()).await?;
-        let registry = DecoderRegistry::default();
-        let decoded = tile.decode(&registry)?;
 
-        /// Читывает один тайл (tile_x, tile_y) и декодирует его в u16
+        let tile = match ifd.fetch_tile(tile_x, tile_y, self.reader.as_ref()).await {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![0_u16; expected_pixels]),
+        };
+
+        let registry = DecoderRegistry::default();
+        let decoded = match tile.decode(&registry) {
+            Ok(d) => d,
+            Err(e) => {
+                // Если граничный тайл обрезан или пуст в COG — заполняем его NoData (нулями)
+                eprintln!(
+                    "⚠️ Тайл [{}, {}] пропущен как граничный/пустой ({})",
+                    tile_x, tile_y, e
+                );
+                return Ok(vec![0_u16; expected_pixels]);
+            }
+        };
+
         let raw_bytes: &[u8] = decoded.data().as_ref();
-        let pixels: Vec<u16> = raw_bytes
+        let mut pixels: Vec<u16> = raw_bytes
             .array_windows::<2>()
             .step_by(2)
             .map(|&bytes| u16::from_le_bytes(bytes))
             .collect();
 
+        // Гарантируем, что длина вектора строго равна tile_width * tile_height
+        pixels.resize(expected_pixels, 0_u16);
         Ok(pixels)
     }
 
     /// Скачивает сетку (2*radius + 1) x (2*radius + 1) тайлов вокруг центрального и склеивает их в единый растр.
-    /// Возвращает: (склеенный_буфер, общая_ширина, общая_высота, сдвиг_x, сдвиг_y)
     pub async fn fetch_tile_grid_u16(
         &self,
         center_tx: usize,
         center_ty: usize,
         radius: isize,
     ) -> Result<(Vec<u16>, usize, usize, usize, usize), Box<dyn std::error::Error>> {
+        let ifd = self.tiff.ifds().first().ok_or("Нет базового IFD")?;
+        let img_w = ifd.image_width() as usize;
+        let img_h = ifd.image_height() as usize;
+
+        let max_tx = img_w.div_ceil(self.tile_width).saturating_sub(1);
+        let max_ty = img_h.div_ceil(self.tile_height).saturating_sub(1);
+
         let start_tx = (center_tx as isize - radius).max(0) as usize;
         let start_ty = (center_ty as isize - radius).max(0) as usize;
-        let end_tx = (center_tx as isize + radius) as usize;
-        let end_ty = (center_ty as isize + radius) as usize;
+        let end_tx = ((center_tx as isize + radius) as usize).min(max_tx);
+        let end_ty = ((center_ty as isize + radius) as usize).min(max_ty);
 
         let cols = end_tx - start_tx + 1;
         let rows = end_ty - start_ty + 1;
+
         let total_w = cols * self.tile_width;
         let total_h = rows * self.tile_height;
 
-        // Готовим параллельные задачи на скачивание всех тайлов сетки
         let mut tasks = Vec::with_capacity(cols * rows);
         for ty in start_ty..=end_ty {
             for tx in start_tx..=end_tx {
@@ -131,7 +155,6 @@ impl RemoteCog {
         let tiles = try_join_all(tasks).await?;
         let mut stitched = vec![0_u16; total_w * total_h];
 
-        // Раскладываем каждый скачанный тайл на своё место в большом холсте
         for (tx, ty, data) in tiles {
             let col_idx = tx - start_tx;
             let row_idx = ty - start_ty;
