@@ -1,4 +1,5 @@
 pub mod blind_search;
+pub mod dem_search;
 pub mod geojson_export;
 pub mod math_ndvi;
 pub mod reqwest_range_reader;
@@ -71,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let b04_asset = best_item.assets.get("B04").ok_or("Нет канала B04")?;
     let b08_asset = best_item.assets.get("B08").ok_or("Нет канала B08")?;
+    let b11_asset = best_item.assets.get("B11").ok_or("Нет канала B11")?;
 
     let transform = b04_asset
         .extra
@@ -105,21 +107,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .await?;
 
+    let b11_signed: Value = http
+        .get(sign_url)
+        .query(&[("href", b11_asset.href.as_str())])
+        .send()
+        .await?
+        .json()
+        .await?;
+
     let b04_url = b04_signed["href"].as_str().ok_or("Не подписался B04")?;
     let b08_url = b08_signed["href"].as_str().ok_or("Не подписался B08")?;
+    let b11_url = b11_signed["href"].as_str().ok_or("Не подписалсяся B11")?;
 
     // 4. Открываем заголовки COG и узнаём реальные размеры тайла
-    let (b04_cog_res, b08_cog_res) = tokio::join!(
+    let (b04_cog_res, b08_cog_res, b11_cog_res) = tokio::join!(
         RemoteCog::open(&http, b04_url),
         RemoteCog::open(&http, b08_url),
+        RemoteCog::open(&http, b11_url),
     );
     let b04_cog = b04_cog_res?;
     let b08_cog = b08_cog_res?;
+    let b11_cog = b11_cog_res?;
 
     let tw = b04_cog.tile_width;
     let th = b04_cog.tile_height;
     let center_tx = global_px / tw;
     let center_ty = global_py / th;
+
+    let global_px_20m = global_px / 2;
+    let global_py_20m = global_py / 2;
+    let center_tx_11 = global_px_20m / b11_cog.tile_width;
+    let center_ty_11 = global_py_20m / b11_cog.tile_height;
 
     println!(
         "2. Качаем сетку 3x3 тайла вокруг [{}, {}] параллельно по Range...",
@@ -127,12 +145,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 5. Параллельно качаем 3x3 тайла для обоих каналов
-    let (grid04_res, grid08_res) = tokio::join!(
+    let (grid04_res, grid08_res, grid11_res) = tokio::join!(
         b04_cog.fetch_tile_grid_u16(center_tx, center_ty, 1),
         b08_cog.fetch_tile_grid_u16(center_tx, center_ty, 1),
+        b11_cog.fetch_tile_grid_u16(center_tx_11, center_ty_11, 1),
     );
     let (b04_pixels, total_w, total_h, off_x, off_y) = grid04_res?;
     let (b08_pixels, w08, h08, _, _) = grid08_res?;
+    let (b11_raw, w11, h11, off_x11, off_y11) = grid11_res?;
+
+    let start_gx_10 = (center_tx * tw) - off_x;
+    let start_gy_10 = (center_ty * th) - off_y;
+    let start_gx_20 = (center_tx_11 * b11_cog.tile_width) - off_x11;
+    let start_gy_20 = (center_ty_11 * b11_cog.tile_height) - off_y11;
+
+    let mut b11_pixels = vec![0_u16; total_w * total_h];
+    for y in 0..total_h {
+        let gy_20 = (start_gy_10 + y) / 2;
+        if gy_20 >= start_gy_20 && gy_20 < start_gy_20 + h11 {
+            let ly_20 = gy_20 - start_gy_20;
+            for x in 0..total_w {
+                let gx_20 = (start_gx_10 + x) / 2;
+                if gx_20 >= start_gx_20 && gx_20 < start_gx_20 + w11 {
+                    let lx_20 = gx_20 - start_gx_20;
+                    b11_pixels[y * total_w + x] = b11_raw[ly_20 * w11 + lx_20];
+                }
+            }
+        }
+    }
 
     if b04_pixels.len() != b08_pixels.len() {
         return Err(format!(
@@ -163,7 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", control_analysis);
 
     // 7. Считаем общую 2D-матрицу NDVI для дальнейших алгоритмов
-    let ndvi_grid = math_ndvi::compute_ndvi_grid(&b04_pixels, &b08_pixels);
+    let ndvi_grid = math_ndvi::compute_ndvi_grid(&b04_pixels, &b08_pixels, &b11_pixels);
 
     // 8. ГРАДИЕНТ: Радиальный профиль (кольца по 200 м до 3.6 км)
     let profile = math_ndvi::build_radial_profile(
@@ -178,9 +218,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== 5. Радиальный профиль NDVI от эпицентра Буракебугу ===");
     println!("{}", profile);
 
-    // 9. СЛЕПОЙ ПОИСК: Сканируем весь холст 15.3x15.3 км скользящим окном
-    let top_anomalies = blind_search::find_top_anomalies(
+    // 9. СЛЕПОЙ ПОИСК: Сканируем весь холст 15.3x15.3 км скользящим окном и рельеф
+
+    println!(
+        "\n=== 6. Загрузка цифровой модели рельефа (Copernicus DEM 30m) и поиск просадок... ==="
+    );
+    let canvas_origin_gx = (center_tx - 1) * tw;
+    let canvas_origin_gy = (center_ty - 1) * th;
+
+    let search_bbox = vec![-45.25, -16.43, -45.12, -16.30];
+    let dem_grid = dem_search::fetch_aligned_dem(
+        &client,
+        &http,
+        &search_bbox,
+        origin_x,
+        origin_y,
+        res_x,
+        res_y,
+        canvas_origin_gx,
+        canvas_origin_gy,
+        total_w,
+        total_h,
+    )
+    .await?;
+
+    let top_anomalies = dem_search::find_geological_anomalies(
         &ndvi_grid,
+        &dem_grid,
         total_w,
         total_h,
         stitched_cx,
@@ -188,6 +252,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res_x.abs(),
         5,
     );
+
+    println!("\n=== 7. ТОП-5 ГЕОЛОГИЧЕСКИХ АНОМАЛИЙ (ЗАМКНУТАЯ ПРОСАДКА РЕЛЬЕФА + NDVI) ===");
+    println!(
+        "{:<5} | {:<10} | {:<10} | {:<10} | {:<11} | {:<9}",
+        "Ранг", "Core NDVI", "Фон NDVI", "ΔNDVI", "Просадка(м)", "Z-Score"
+    );
+    println!("{}", "-".repeat(72));
+
+    for (i, anom) in top_anomalies.iter().enumerate() {
+        println!(
+            "#{:<4} | {:<10.4} | {:<10.4} | {:<+10.4} | {:<11.2} | {:<+9.2}",
+            i + 1,
+            anom.core_ndvi,
+            anom.bg_ndvi,
+            anom.delta_ndvi,
+            anom.symmetry_diff,
+            anom.z_score
+        );
+    }
+
+    // let top_anomalies = blind_search::find_top_anomalies(
+    //     &ndvi_grid,
+    //     total_w,
+    //     total_h,
+    //     stitched_cx,
+    //     stitched_cy,
+    //     res_x.abs(),
+    //     5,
+    // );
 
     println!("\n=== 6. ТОП-5 НЕЗАВИСИМЫХ АНОМАЛИЙ (СЛЕПОЙ ПОИСК) ===");
     println!(

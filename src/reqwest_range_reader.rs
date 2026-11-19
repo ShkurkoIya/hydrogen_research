@@ -175,4 +175,97 @@ impl RemoteCog {
 
         Ok((stitched, total_w, total_h, offset_x, offset_y))
     }
+
+    /// Вычитывает один тайл высот (DEM) и декодирует его в f32 (метры над уровнем моря)
+    pub async fn fetch_tile_f32(
+        &self,
+        tile_x: usize,
+        tile_y: usize,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let expected_pixels = self.tile_width * self.tile_height;
+        let ifd = self.tiff.ifds().first().ok_or("Нет базового IFD")?;
+
+        let tile = match ifd.fetch_tile(tile_x, tile_y, self.reader.as_ref()).await {
+            Ok(t) => t,
+            Err(_) => return Ok(vec![f32::NAN; expected_pixels]),
+        };
+
+        let registry = DecoderRegistry::default();
+        let decoded = match tile.decode(&registry) {
+            Ok(d) => d,
+            Err(_) => return Ok(vec![f32::NAN; expected_pixels]),
+        };
+
+        let raw_bytes: &[u8] = decoded.data().as_ref();
+        let mut pixels: Vec<f32> = raw_bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        pixels.resize(expected_pixels, f32::NAN);
+        Ok(pixels)
+    }
+
+    /// Скачивает сетку (2*radius + 1) x (2*radius + 1) тайлов высот DEM
+    pub async fn fetch_tile_grid_f32(
+        &self,
+        center_tx: usize,
+        center_ty: usize,
+        radius: isize,
+    ) -> Result<(Vec<f32>, usize, usize, usize, usize), Box<dyn std::error::Error>> {
+        let ifd = self.tiff.ifds().first().ok_or("Нет базового IFD")?;
+        let img_w = ifd.image_width() as usize;
+        let img_h = ifd.image_height() as usize;
+
+        let max_tx = img_w.div_ceil(self.tile_width).saturating_sub(1);
+        let max_ty = img_h.div_ceil(self.tile_height).saturating_sub(1);
+
+        let start_tx = (center_tx as isize - radius).max(0) as usize;
+        let start_ty = (center_ty as isize - radius).max(0) as usize;
+        let end_tx = ((center_tx as isize + radius) as usize).min(max_tx);
+        let end_ty = ((center_ty as isize + radius) as usize).min(max_ty);
+
+        let cols = end_tx - start_tx + 1;
+        let rows = end_ty - start_ty + 1;
+        let total_w = cols * self.tile_width;
+        let total_h = rows * self.tile_height;
+
+        let mut tasks = Vec::with_capacity(cols * rows);
+        for ty in start_ty..=end_ty {
+            for tx in start_tx..=end_tx {
+                tasks.push(async move {
+                    let data = self.fetch_tile_f32(tx, ty).await?;
+                    Ok::<(usize, usize, Vec<f32>), Box<dyn std::error::Error>>((tx, ty, data))
+                });
+            }
+        }
+
+        let tiles = try_join_all(tasks).await?;
+        let mut stitched = vec![f32::NAN; total_w * total_h];
+
+        for (tx, ty, data) in tiles {
+            let col_idx = tx - start_tx;
+            let row_idx = ty - start_ty;
+            let base_x = col_idx * self.tile_width;
+            let base_y = row_idx * self.tile_height;
+
+            for y in 0..self.tile_height {
+                let src_start = y * self.tile_width;
+                let src_end = src_start + self.tile_width;
+                let dst_start = (base_y + y) * total_w + base_x;
+                stitched[dst_start..dst_start + self.tile_width]
+                    .copy_from_slice(&data[src_start..src_end]);
+            }
+        }
+
+        let offset_x = (center_tx - start_tx) * self.tile_width;
+        let offset_y = (center_ty - start_ty) * self.tile_height;
+
+        Ok((stitched, total_w, total_h, offset_x, offset_y))
+    }
+
+    pub fn image_dimensions(&self) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        let ifd = self.tiff.ifds().first().ok_or("Нет базового IFD")?;
+        Ok((ifd.image_width() as usize, ifd.image_height() as usize))
+    }
 }

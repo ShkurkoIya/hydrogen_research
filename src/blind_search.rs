@@ -6,6 +6,7 @@ pub struct AnomalyCandidate {
     pub core_ndvi: f64,
     pub bg_ndvi: f64,
     pub z_score: f64,
+    pub symmetry_diff: f64,
     pub dist_to_well_m: f64,
 }
 
@@ -66,10 +67,10 @@ pub fn find_top_anomalies(
     let sat = IntegralImage::new(ndvi_grid, total_w, total_h);
 
     // Размеры скользящего окна в пикселях (1 px = 10 м):
-    let r_core = 15_usize; // Ядро ~1.4x1.4 км (эквивалент круга R=800м)
-    let r_buf = 30_usize; // Буферная зона ~1.4 км
-    let r_bg = 80_usize; // Внешний фон ~3.1 км
-    let step = 20_usize; // Шаг сканирования = 200 метров
+    let r_core = 9_usize; // Ядро ~180x180 m
+    let r_buf = 12_usize; // Ободок 240x240 m
+    let r_bg = 24_usize; // Внешний фон ~480x480 m
+    let step = 6_usize; // Шаг сканирования = 60 m
 
     let mut raw_candidates = Vec::new();
     let mut all_deltas = Vec::new();
@@ -85,20 +86,52 @@ pub fn find_top_anomalies(
             let ring_cnt = bg_cnt - buf_cnt;
 
             // Отбрасываем окна, где много битых пикселей (NoData)
-            if core_cnt < 700 || ring_cnt < 15000 {
+            if core_cnt < 300 || ring_cnt < 1400 {
                 continue;
             }
 
             let core_mean = core_sum / core_cnt as f64;
             let ring_mean = ring_sum / ring_cnt as f64;
+
+            // Отсекаем плотный прибрежный лес и орошаемые поля (круги формируются в сухой саванне)
+            if ring_mean > 0.52 {
+                continue;
+            }
+
             let delta = core_mean - ring_mean;
 
             all_deltas.push(delta);
 
+            // ФИЛЬТР «АНТИ-ЗАБОР»: Проверяем радиальную симметрию по 4 секторам (С, Ю, З, В)
+            let (n_s, n_c) = sat.query(cx - r_core, cy - r_bg, cx + r_core, cy - r_buf);
+            let (s_s, s_c) = sat.query(cx - r_core, cy + r_buf, cx + r_core, cy + r_bg);
+            let (w_s, w_c) = sat.query(cx - r_bg, cy - r_core, cx - r_buf, cy + r_core);
+            let (e_s, e_c) = sat.query(cx + r_buf, cy - r_core, cx + r_bg, cy + r_core);
+
+            if n_c < 150 || s_c < 150 || w_c < 150 || e_c < 150 {
+                continue;
+            }
+
+            let sectors = [
+                n_s / n_c as f64,
+                s_s / s_c as f64,
+                w_s / w_c as f64,
+                e_s / e_c as f64,
+            ];
+
+            let max_sec = sectors.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min_sec = sectors.iter().cloned().fold(f64::INFINITY, f64::min);
+            let symmetry_diff = max_sec - min_sec;
+
+            // Отсекаем дороги, ручьи и прямые границы пастбищ (где одна сторона лес, а другая пустошь)
+            if symmetry_diff > 0.075 {
+                continue;
+            }
+
             let dist_m = (((cx as f32 - well_cx).powi(2) + (cy as f32 - well_cy).powi(2)).sqrt()
                 * pixel_size_m as f32) as f64;
 
-            raw_candidates.push((cx, cy, delta, core_mean, ring_mean, dist_m));
+            raw_candidates.push((cx, cy, delta, core_mean, ring_mean, symmetry_diff, dist_m));
         }
     }
 
@@ -111,18 +144,19 @@ pub fn find_top_anomalies(
         / all_deltas.len() as f64;
     let std_delta = variance.sqrt();
 
-    // Сортируем от самой глубокой отрицательной аномалии к слабым
+    // Сортируем по силе контраста (по модулю), чтобы ловить и лысые центры, и зеленые ядра в светлом кольце
+    // raw_candidates.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap());
     raw_candidates.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
     // Фильтруем дубликаты (Non-Maximum Suppression): берем точки не ближе 1.5 км друг к другу
     let mut top_anomalies: Vec<AnomalyCandidate> = Vec::new();
-    for (cx, cy, delta, core_ndvi, bg_ndvi, dist_to_well_m) in raw_candidates {
+    for (cx, cy, delta, core_ndvi, bg_ndvi, symmetry_diff, dist_to_well_m) in raw_candidates {
         let too_close = top_anomalies.iter().any(|picked| {
             let d = (((cx as f64 - picked.cx as f64).powi(2)
                 + (cy as f64 - picked.cy as f64).powi(2))
             .sqrt())
                 * pixel_size_m;
-            d < 1500.0
+            d < 350.0
         });
 
         if !too_close {
@@ -134,6 +168,7 @@ pub fn find_top_anomalies(
                 core_ndvi,
                 bg_ndvi,
                 z_score,
+                symmetry_diff,
                 dist_to_well_m,
             });
 

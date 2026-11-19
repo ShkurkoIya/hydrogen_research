@@ -76,7 +76,7 @@ pub fn export_anomalies_to_geojson(
         let lon = center_pt.0.to_degrees();
         let lat = center_pt.1.to_degrees();
 
-        let half_box_m = 300.0;
+        let half_box_m = 150.0;
         let corners_utm = [
             (utm_px - half_box_m, utm_py - half_box_m),
             (utm_px + half_box_m, utm_py - half_box_m),

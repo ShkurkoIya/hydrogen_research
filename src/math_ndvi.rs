@@ -2,31 +2,44 @@ use polars::prelude::*;
 use std::error::Error;
 
 /// Переводит сырые значения каналов Sentinel-2 (B04, B08) в матрицу физического NDVI
-pub fn compute_ndvi_grid(b04_pixels: &[u16], b08_pixels: &[u16]) -> Vec<f64> {
-    b04_pixels
-        .iter()
-        .zip(b08_pixels.iter())
-        .map(|(&raw_b04, &raw_b08)| {
-            if raw_b04 == 0 || raw_b08 == 0 {
-                return f64::NAN;
-            }
+pub fn compute_ndvi_grid(b04_pixels: &[u16], b08_pixels: &[u16], b11_pixels: &[u16]) -> Vec<f64> {
+    let n = b04_pixels.len();
+    let mut grid = Vec::with_capacity(n);
 
-            if raw_b04 > 2800 || raw_b08 < 1800 {
-                return f64::NAN;
-            }
+    for i in 0..n {
+        let raw_b04 = b04_pixels[i];
+        let raw_b08 = b08_pixels[i];
+        let raw_b11 = b11_pixels[i];
 
-            // Физическая калибровка ESA (Offset -1000)
-            let r = ((raw_b04 as f64 - 1000.0) / 10000.0).max(0.0);
-            let nir = ((raw_b08 as f64 - 1000.0) / 10000.0).max(0.0);
-            let ndvi = (nir - r) / (nir + r + 1e-6);
+        if raw_b04 == 0 || raw_b08 == 0 || raw_b11 == 0 {
+            grid.push(f64::NAN);
+            continue;
+        }
 
-            if ndvi < 0.08 {
-                return f64::NAN;
-            }
+        // Отсекаем облака, тени и слепящий белый песок ручьев
+        if raw_b04 > 2800 || raw_b08 < 1800 {
+            grid.push(f64::NAN);
+            continue;
+        }
 
-            ndvi
-        })
-        .collect()
+        // Физическая калибровка ESA (Offset -1000)
+        let r = ((raw_b04 as f64 - 1000.0) / 10000.0).max(0.0);
+        let nir = ((raw_b08 as f64 - 1000.0) / 10000.0).max(0.0);
+        let swir = ((raw_b11 as f64 - 1000.0) / 10000.0).max(0.0);
+
+        let ndvi = (nir - r) / (nir + r + 1e-6);
+        let ndbi = (swir - nir) / (swir + nir + 1e-6);
+
+        // Отсекаем воду (ndvi < 0.08) и антропогенку/открытый песок (ndbi > 0.05)
+        if ndvi < 0.08 || ndbi > 0.28 {
+            grid.push(f64::NAN);
+            continue;
+        }
+
+        grid.push(ndvi);
+    }
+
+    grid
 }
 
 /// Строит таблицу деградации растительности по концентрическим кольцам от центра скважины
